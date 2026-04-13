@@ -208,12 +208,6 @@ h1, h2, h3 {
     font-weight: 700;
 }
 
-hr {
-    border: none;
-    border-top: 1px solid rgba(255,255,255,0.08);
-    margin: 24px 0;
-}
-
 [data-testid="stDataFrame"] {
     border: 1px solid rgba(255,255,255,0.08);
     border-radius: 14px;
@@ -263,7 +257,9 @@ def format_view(df: pd.DataFrame) -> pd.DataFrame:
         "status"
     ]
     available = [c for c in cols if c in df.columns]
-    return df[available].rename(columns={
+    formatted = df[available].copy()
+
+    rename_map = {
         "date_A": "Platform Date",
         "amount_A": "Platform Amount",
         "type_A": "Platform Type",
@@ -273,7 +269,14 @@ def format_view(df: pd.DataFrame) -> pd.DataFrame:
         "type_B": "Bank Type",
         "reference_B": "Bank Ref",
         "status": "Status"
-    })
+    }
+    formatted = formatted.rename(columns=rename_map)
+
+    for col in ["Platform Date", "Bank Date"]:
+        if col in formatted.columns:
+            formatted[col] = pd.to_datetime(formatted[col], errors="coerce").dt.strftime("%Y-%m-%d")
+
+    return formatted
 
 def show_table_or_empty(title: str, df: pd.DataFrame, empty_text: str):
     st.markdown(f"#### {title}")
@@ -284,7 +287,10 @@ def show_table_or_empty(title: str, df: pd.DataFrame, empty_text: str):
 
 # ---------------------- HEADER ----------------------
 st.title("💰 Payment Reconciliation Dashboard")
-st.markdown('<div class="subtle">Upload Platform and Bank CSVs to analyze mismatches, explain root causes, and build a reconciliation bridge.</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="subtle">Upload Platform and Bank CSVs to analyze mismatches, explain root causes, and build a reconciliation bridge.</div>',
+    unsafe_allow_html=True
+)
 
 col1, col2 = st.columns(2)
 with col1:
@@ -296,13 +302,29 @@ if file_a and file_b:
     df_a = pd.read_csv(file_a)
     df_b = pd.read_csv(file_b)
 
-    # Basic cleanup
+    # ---------------------- CLEANUP ----------------------
+    required_cols = {"transaction_id", "date", "amount", "type", "reference"}
+    if not required_cols.issubset(df_a.columns) or not required_cols.issubset(df_b.columns):
+        st.error("Both files must contain these columns: transaction_id, date, amount, type, reference")
+        st.stop()
+
+    df_a = df_a.copy()
+    df_b = df_b.copy()
+
     df_a["amount"] = pd.to_numeric(df_a["amount"], errors="coerce")
     df_b["amount"] = pd.to_numeric(df_b["amount"], errors="coerce")
     df_a["date"] = pd.to_datetime(df_a["date"], errors="coerce")
     df_b["date"] = pd.to_datetime(df_b["date"], errors="coerce")
-    df_a["type"] = df_a["type"].astype(str).str.lower()
-    df_b["type"] = df_b["type"].astype(str).str.lower()
+    df_a["type"] = df_a["type"].astype(str).str.lower().str.strip()
+    df_b["type"] = df_b["type"].astype(str).str.lower().str.strip()
+    df_a["reference"] = df_a["reference"].astype(str).str.strip()
+    df_b["reference"] = df_b["reference"].astype(str).str.strip()
+    df_a["transaction_id"] = df_a["transaction_id"].astype(str).str.strip()
+    df_b["transaction_id"] = df_b["transaction_id"].astype(str).str.strip()
+
+    if df_a["amount"].isna().any() or df_b["amount"].isna().any():
+        st.error("Some amount values could not be read as numbers.")
+        st.stop()
 
     total_a = round(df_a["amount"].sum(), 2)
     total_b = round(df_b["amount"].sum(), 2)
@@ -328,16 +350,32 @@ if file_a and file_b:
     merged.loc[merged["_merge"] == "left_only", "status"] = "Missing in Bank"
     merged.loc[merged["_merge"] == "right_only", "status"] = "Missing in Platform"
 
-    # Gap datasets
-    missing_bank = merged[merged["status"] == "Missing in Bank"].copy()
+    # ---------------------- GAP DATASETS ----------------------
+    # Orphan refunds from Platform
+    payment_refs = set(df_a[df_a["type"] == "payment"]["reference"].dropna())
+    refunds = df_a[
+        (df_a["type"] == "refund") &
+        (~df_a["reference"].isin(payment_refs))
+    ].copy()
+
+    orphan_refund_ids = set(refunds["transaction_id"].astype(str).tolist())
+
+    # Missing in Bank should exclude orphan refunds to avoid double counting
+    missing_bank = merged[
+        (merged["status"] == "Missing in Bank") &
+        (~merged["transaction_id"].astype(str).isin(orphan_refund_ids))
+    ].copy()
+
     missing_platform = merged[merged["status"] == "Missing in Platform"].copy()
 
+    # Duplicates in Bank
     dup_bank_rows = df_b[df_b.duplicated("transaction_id", keep=False)].copy()
     duplicate_counts = dup_bank_rows.groupby("transaction_id").size().reset_index(name="count")
     duplicates = merged.merge(duplicate_counts, on="transaction_id", how="inner").copy()
     duplicates["status"] = "Duplicate"
-    duplicates = duplicates.drop_duplicates(subset=["transaction_id"])
+    duplicates = duplicates.drop_duplicates(subset=["transaction_id"]).copy()
 
+    # Rounding differences
     rounding = merged[
         (merged["amount_A"].notna()) &
         (merged["amount_B"].notna()) &
@@ -346,6 +384,7 @@ if file_a and file_b:
     ].copy()
     rounding["status"] = "Rounding Difference"
 
+    # Timing differences
     timing = merged[
         (merged["date_A"].notna()) &
         (merged["date_B"].notna()) &
@@ -356,12 +395,6 @@ if file_a and file_b:
     ].copy()
     timing["status"] = "Timing Difference"
 
-    payment_refs = set(df_a[df_a["type"] == "payment"]["reference"].dropna())
-    refunds = df_a[
-        (df_a["type"] == "refund") &
-        (~df_a["reference"].isin(payment_refs))
-    ].copy()
-
     # ---------------------- IMPACTS ----------------------
     duplicate_impact = 0.0
     if not dup_bank_rows.empty:
@@ -370,10 +403,22 @@ if file_a and file_b:
         dup_calc["impact"] = dup_calc["extra_count"] * dup_calc["first"]
         duplicate_impact = round(dup_calc["impact"].sum(), 2)
 
-    rounding_impact = round((rounding["amount_B"] - rounding["amount_A"]).sum(), 2) if not rounding.empty else 0.0
-    missing_bank_impact = round(-missing_bank["amount_A"].fillna(0).sum(), 2) if not missing_bank.empty else 0.0
-    missing_platform_impact = round(missing_platform["amount_B"].fillna(0).sum(), 2) if not missing_platform.empty else 0.0
-    orphan_refund_impact = round(-refunds["amount"].sum(), 2) if not refunds.empty else 0.0
+    rounding_impact = 0.0
+    if not rounding.empty:
+        rounding_impact = round((rounding["amount_B"] - rounding["amount_A"]).sum(), 2)
+
+    # Fixed: only non-refund platform-only rows are counted here
+    missing_bank_impact = 0.0
+    if not missing_bank.empty:
+        missing_bank_impact = round(-missing_bank["amount_A"].fillna(0).sum(), 2)
+
+    missing_platform_impact = 0.0
+    if not missing_platform.empty:
+        missing_platform_impact = round(missing_platform["amount_B"].fillna(0).sum(), 2)
+
+    orphan_refund_impact = 0.0
+    if not refunds.empty:
+        orphan_refund_impact = round(-refunds["amount"].sum(), 2)
 
     explained_difference = round(
         duplicate_impact +
@@ -384,20 +429,38 @@ if file_a and file_b:
         2
     )
 
+    adjusted_total = round(
+        total_a +
+        duplicate_impact +
+        rounding_impact +
+        missing_bank_impact +
+        missing_platform_impact +
+        orphan_refund_impact,
+        2
+    )
+
+    remaining_unexplained = round(total_b - adjusted_total, 2)
+
     # ---------------------- GAP ANALYSIS ----------------------
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
     st.markdown("## 🔍 Gap Analysis")
 
+    gap_index = 1
+
     if not timing.empty:
         row = timing.iloc[0]
+        timing_amount = 0.0
+        if pd.notna(row.get("amount_A")):
+            timing_amount = float(row.get("amount_A"))
+
         st.markdown(f"""
         <div class="gap-card critical">
             <div class="gap-head">
                 <div class="gap-title">
-                    Gap #1: Settlement Timing Difference
+                    Gap #{gap_index}: Settlement Timing Difference
                     <span class="badge badge-critical">CRITICAL</span>
                 </div>
-                <div class="gap-amount">{money(missing_bank_impact if missing_bank_impact != 0 else 0)}</div>
+                <div class="gap-amount">{money(-timing_amount)}</div>
             </div>
             <div>
                 <b>Transaction:</b> {row.get("transaction_id", "")}<br>
@@ -405,18 +468,21 @@ if file_a and file_b:
                 <b>Bank Settlement:</b> {row.get("date_B").date() if pd.notna(row.get("date_B")) else "-"}<br>
                 <b>Impact:</b> Platform recorded the transaction in one period, but bank settled it in another period.
             </div>
-            <div class="resolution">Resolution: Carry forward this item or post an accrual adjustment until settlement appears in the correct bank period.</div>
+            <div class="resolution">Resolution: Carry this item forward or post an accrual adjustment until the settlement appears in the right bank period.</div>
         </div>
         """, unsafe_allow_html=True)
+        gap_index += 1
 
     if duplicate_impact != 0:
         row = duplicates.iloc[0]
         count_value = int(row.get("count", 2)) if "count" in row else 2
+        amount_per_entry = float(row.get("amount_B", 0)) if pd.notna(row.get("amount_B")) else 0.0
+
         st.markdown(f"""
         <div class="gap-card critical">
             <div class="gap-head">
                 <div class="gap-title">
-                    Gap #2: Duplicate Entry
+                    Gap #{gap_index}: Duplicate Entry
                     <span class="badge badge-critical">CRITICAL</span>
                 </div>
                 <div class="gap-amount">{money(duplicate_impact)}</div>
@@ -425,38 +491,42 @@ if file_a and file_b:
                 <b>Transaction:</b> {row.get("transaction_id", "")}<br>
                 <b>Platform Count:</b> 1 entry<br>
                 <b>Bank Count:</b> {count_value} entries<br>
-                <b>Amount per entry:</b> {money(float(row.get("amount_B", 0) if pd.notna(row.get("amount_B")) else 0))}<br>
-                <b>Impact:</b> Bank total is inflated due to one or more duplicate settlements.
+                <b>Amount per entry:</b> {money(amount_per_entry)}<br>
+                <b>Impact:</b> Bank total is inflated because the same transaction appears more than once.
             </div>
-            <div class="resolution">Resolution: Validate bank statement lineage and remove duplicate settlement from the reconciled balance.</div>
+            <div class="resolution">Resolution: Validate source statement lineage and remove the extra bank copy from the reconciled balance.</div>
         </div>
         """, unsafe_allow_html=True)
+        gap_index += 1
 
     if rounding_impact != 0:
+        txn_list = ", ".join(rounding["transaction_id"].astype(str).tolist())
         st.markdown(f"""
         <div class="gap-card warning">
             <div class="gap-head">
                 <div class="gap-title">
-                    Gap #3: Rounding Difference
+                    Gap #{gap_index}: Rounding Difference
                     <span class="badge badge-warning">WARNING</span>
                 </div>
                 <div class="gap-amount">{money(rounding_impact)}</div>
             </div>
             <div>
-                <b>Transactions:</b> {", ".join(rounding["transaction_id"].astype(str).tolist())}<br>
-                <b>Impact:</b> Small row-level amount differences accumulate when totals are summed.
+                <b>Transactions:</b> {txn_list}<br>
+                <b>Impact:</b> Small row-level decimal differences accumulate when totals are summed.
             </div>
-            <div class="resolution">Resolution: Apply a rounding tolerance policy or standardize rounding before reconciliation.</div>
+            <div class="resolution">Resolution: Apply a tolerance rule or standard rounding policy before reconciliation.</div>
         </div>
         """, unsafe_allow_html=True)
+        gap_index += 1
 
     if not refunds.empty:
         row = refunds.iloc[0]
+        refund_amount = float(row.get("amount", 0)) if pd.notna(row.get("amount")) else 0.0
         st.markdown(f"""
         <div class="gap-card info">
             <div class="gap-head">
                 <div class="gap-title">
-                    Gap #4: Orphan Refund
+                    Gap #{gap_index}: Orphan Refund
                     <span class="badge badge-info">INVESTIGATE</span>
                 </div>
                 <div class="gap-amount">{money(orphan_refund_impact)}</div>
@@ -464,31 +534,44 @@ if file_a and file_b:
             <div>
                 <b>Transaction:</b> {row.get("transaction_id", "")}<br>
                 <b>Date:</b> {row.get("date").date() if pd.notna(row.get("date")) else "-"}<br>
-                <b>Amount:</b> {money(float(row.get("amount", 0) if pd.notna(row.get("amount")) else 0))}<br>
-                <b>Issue:</b> Refund exists but the original payment is not present in the available platform payment records.
+                <b>Amount:</b> {money(refund_amount)}<br>
+                <b>Issue:</b> Refund exists but the original payment is not present in the available payment records.
             </div>
-            <div class="resolution">Resolution: Check prior-period data or refund processing logs to confirm whether this is valid or an upstream data issue.</div>
+            <div class="resolution">Resolution: Check prior-period data or refund logs to confirm whether this is valid or a data issue.</div>
+        </div>
+        """, unsafe_allow_html=True)
+        gap_index += 1
+
+    if not missing_platform.empty:
+        row = missing_platform.iloc[0]
+        amt = float(row.get("amount_B", 0)) if pd.notna(row.get("amount_B")) else 0.0
+        st.markdown(f"""
+        <div class="gap-card info">
+            <div class="gap-head">
+                <div class="gap-title">
+                    Gap #{gap_index}: Missing in Platform
+                    <span class="badge badge-info">INVESTIGATE</span>
+                </div>
+                <div class="gap-amount">{money(missing_platform_impact)}</div>
+            </div>
+            <div>
+                <b>Transaction:</b> {row.get("transaction_id", "")}<br>
+                <b>Bank Date:</b> {row.get("date_B").date() if pd.notna(row.get("date_B")) else "-"}<br>
+                <b>Amount:</b> {money(amt)}<br>
+                <b>Issue:</b> Transaction exists in bank records but is not present in platform records.
+            </div>
+            <div class="resolution">Resolution: Check whether this transaction failed ingestion, was posted manually, or belongs to another source system.</div>
         </div>
         """, unsafe_allow_html=True)
 
-    if timing.empty and duplicate_impact == 0 and rounding_impact == 0 and refunds.empty and missing_platform.empty and missing_bank.empty:
+    if gap_index == 1:
         st.success("✅ No discrepancy gaps identified.")
+
     st.markdown('</div>', unsafe_allow_html=True)
 
     # ---------------------- RECONCILIATION BRIDGE ----------------------
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
     st.markdown("## 📊 Reconciliation Bridge")
-
-    adjusted_total = round(
-        total_a
-        + duplicate_impact
-        + rounding_impact
-        + missing_bank_impact
-        + missing_platform_impact
-        + orphan_refund_impact,
-        2
-    )
-    remaining_unexplained = round(total_b - adjusted_total, 2)
 
     bridge_html = f"""
     <table class="bridge-table">
@@ -533,12 +616,18 @@ if file_a and file_b:
     st.markdown(bridge_html, unsafe_allow_html=True)
 
     if remaining_unexplained == 0:
-        st.markdown('<div class="small-note status-ok">✓ All discrepancy drivers are fully explained by the bridge.</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="small-note status-ok">✓ All discrepancy drivers are fully explained by the bridge.</div>',
+            unsafe_allow_html=True
+        )
     else:
-        st.markdown('<div class="small-note status-warn">⚠ Some variance remains unexplained. This may indicate overlapping cases or additional business rules are needed.</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="small-note status-warn">⚠ Some variance remains unexplained. Check whether one issue is uncategorized or whether more business rules are needed.</div>',
+            unsafe_allow_html=True
+        )
 
     st.markdown(
-        f"""
+        """
         <div class="small-note">
         Formula used: <br>
         <code>
@@ -564,26 +653,49 @@ if file_a and file_b:
     ])
 
     with tab1:
-        show_table_or_empty("Transactions present in Platform but missing in Bank", missing_bank, "✅ No transactions missing in Bank")
+        show_table_or_empty(
+            "Transactions present in Platform but missing in Bank",
+            missing_bank,
+            "✅ No non-refund transactions missing in Bank"
+        )
 
     with tab2:
-        show_table_or_empty("Transactions present in Bank but missing in Platform", missing_platform, "✅ No transactions missing in Platform")
+        show_table_or_empty(
+            "Transactions present in Bank but missing in Platform",
+            missing_platform,
+            "✅ No transactions missing in Platform"
+        )
 
     with tab3:
-        show_table_or_empty("Duplicate transactions found in Bank", duplicates, "✅ No duplicate transactions found")
+        show_table_or_empty(
+            "Duplicate transactions found in Bank",
+            duplicates,
+            "✅ No duplicate transactions found"
+        )
 
     with tab4:
-        show_table_or_empty("Transactions with rounding differences", rounding, "✅ No rounding differences found")
+        show_table_or_empty(
+            "Transactions with rounding differences",
+            rounding,
+            "✅ No rounding differences found"
+        )
 
     with tab5:
-        show_table_or_empty("Transactions settled in a different period", timing, "✅ No timing differences found")
+        show_table_or_empty(
+            "Transactions settled in a different period",
+            timing,
+            "✅ No timing differences found"
+        )
 
     with tab6:
         st.markdown("#### Refunds without matching original payment")
         if refunds.empty:
             st.success("✅ No orphan refunds found")
         else:
-            st.dataframe(refunds, use_container_width=True)
+            refunds_display = refunds.copy()
+            if "date" in refunds_display.columns:
+                refunds_display["date"] = pd.to_datetime(refunds_display["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+            st.dataframe(refunds_display, use_container_width=True)
 
     st.markdown('</div>', unsafe_allow_html=True)
 
